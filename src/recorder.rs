@@ -336,10 +336,10 @@ fn record_dual_loop(
 
     while !stop_flag.load(Ordering::Relaxed) && (mic_open || sys_open) {
         let mic_chunk = if mic_open {
-            match mic_rx.recv_timeout(Duration::from_millis(25)) {
+            match mic_rx.try_recv() {
                 Ok(c) => Some(c),
-                Err(mpsc::RecvTimeoutError::Timeout) => None,
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => {
                     mic_open = false;
                     None
                 }
@@ -349,10 +349,10 @@ fn record_dual_loop(
         };
 
         let sys_chunk = if sys_open {
-            match sys_rx.recv_timeout(Duration::from_millis(25)) {
+            match sys_rx.try_recv() {
                 Ok(c) => Some(c),
-                Err(mpsc::RecvTimeoutError::Timeout) => None,
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => {
                     sys_open = false;
                     None
                 }
@@ -365,7 +365,10 @@ fn record_dual_loop(
             (Some(a), Some(b)) => mix_s16_samples(&a, &b, &mut mixed_bytes),
             (Some(a), None) => mix_s16_samples(&a, &[], &mut mixed_bytes),
             (None, Some(b)) => mix_s16_samples(&[], &b, &mut mixed_bytes),
-            (None, None) => continue,
+            (None, None) => {
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
         }
 
         if let Err(e) = writer.write_all(&mixed_bytes) {

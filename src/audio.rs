@@ -3,7 +3,7 @@ use cpal::{SampleFormat, Stream, StreamConfig};
 use libpulse_binding::sample::{Format as PaFormat, Spec as PaSpec};
 use libpulse_binding::stream::Direction as PaDirection;
 use libpulse_simple_binding::Simple as PaSimple;
-use ringbuf::traits::{Consumer, Producer, Split};
+use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::HeapRb;
 use std::collections::HashMap;
 use std::fs::File;
@@ -230,60 +230,82 @@ impl AudioEngine {
 
         let ratio = TARGET_SAMPLE_RATE as f64 / out_rate.max(1) as f64;
         let mut frac_pos = 0.0f64;
-        let mut cur_l = 0.0f32;
-        let mut cur_r = 0.0f32;
-        let mut has_sample = false;
+        let mut l0 = 0.0f32;
+        let mut r0 = 0.0f32;
+        let mut l1 = 0.0f32;
+        let mut r1 = 0.0f32;
+        let mut initialized = false;
 
         let err_fn = |err| {
             eprintln!("cpal output stream error: {err}");
         };
 
-        let mut fill_frames = move |out: &mut [f32]| {
-            let frames = out.len() / out_channels;
-            for f in 0..frames {
-                if (ratio - 1.0).abs() < 1e-4 {
-                    cur_l = cons.try_pop().unwrap_or(0.0);
-                    cur_r = cons.try_pop().unwrap_or(cur_l);
-                } else {
-                    if !has_sample {
-                        cur_l = cons.try_pop().unwrap_or(0.0);
-                        cur_r = cons.try_pop().unwrap_or(cur_l);
-                        has_sample = true;
-                    }
-                    frac_pos += ratio;
-                    while frac_pos >= 1.0 {
-                        frac_pos -= 1.0;
-                        cur_l = cons.try_pop().unwrap_or(0.0);
-                        cur_r = cons.try_pop().unwrap_or(cur_l);
-                    }
-                }
-                let base = f * out_channels;
-                if out_channels == 1 {
-                    out[base] = (cur_l + cur_r) * 0.5;
-                } else {
-                    out[base] = cur_l;
-                    out[base + 1] = cur_r;
-                    for ch in 2..out_channels {
-                        out[base + ch] = 0.0;
-                    }
-                }
+        let mut next_frame = move || -> (f32, f32) {
+            if (ratio - 1.0).abs() < 1e-4 {
+                let l = cons.try_pop().unwrap_or(0.0);
+                let r = cons.try_pop().unwrap_or(l);
+                return (l, r);
             }
+
+            if !initialized {
+                l0 = cons.try_pop().unwrap_or(0.0);
+                r0 = cons.try_pop().unwrap_or(l0);
+                l1 = cons.try_pop().unwrap_or(l0);
+                r1 = cons.try_pop().unwrap_or(r0);
+                initialized = true;
+            }
+
+            let frac = frac_pos as f32;
+            let l = l0 + (l1 - l0) * frac;
+            let r = r0 + (r1 - r0) * frac;
+
+            frac_pos += ratio;
+            while frac_pos >= 1.0 {
+                frac_pos -= 1.0;
+                l0 = l1;
+                r0 = r1;
+                l1 = cons.try_pop().unwrap_or(0.0);
+                r1 = cons.try_pop().unwrap_or(l1);
+            }
+
+            (l, r)
         };
 
         let stream = match sample_format {
             SampleFormat::F32 => device.build_output_stream(
                 &config,
-                move |data: &mut [f32], _| fill_frames(data),
+                move |data: &mut [f32], _| {
+                    for frame in data.chunks_exact_mut(out_channels) {
+                        let (l, r) = next_frame();
+                        if out_channels == 1 {
+                            frame[0] = (l + r) * 0.5;
+                        } else {
+                            frame[0] = l;
+                            frame[1] = r;
+                            for ch in 2..out_channels {
+                                frame[ch] = 0.0;
+                            }
+                        }
+                    }
+                },
                 err_fn,
                 None,
             ),
             SampleFormat::I16 => device.build_output_stream(
                 &config,
                 move |data: &mut [i16], _| {
-                    let mut tmp = vec![0.0f32; data.len()];
-                    fill_frames(&mut tmp);
-                    for (dst, src) in data.iter_mut().zip(tmp.iter()) {
-                        *dst = (src.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+                    let to_i16 = |s: f32| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+                    for frame in data.chunks_exact_mut(out_channels) {
+                        let (l, r) = next_frame();
+                        if out_channels == 1 {
+                            frame[0] = to_i16((l + r) * 0.5);
+                        } else {
+                            frame[0] = to_i16(l);
+                            frame[1] = to_i16(r);
+                            for ch in 2..out_channels {
+                                frame[ch] = 0;
+                            }
+                        }
                     }
                 },
                 err_fn,
@@ -292,11 +314,19 @@ impl AudioEngine {
             SampleFormat::U16 => device.build_output_stream(
                 &config,
                 move |data: &mut [u16], _| {
-                    let mut tmp = vec![0.0f32; data.len()];
-                    fill_frames(&mut tmp);
-                    for (dst, src) in data.iter_mut().zip(tmp.iter()) {
-                        let s = (src.clamp(-1.0, 1.0) * 0.5 + 0.5) * u16::MAX as f32;
-                        *dst = s as u16;
+                    let to_u16 =
+                        |s: f32| ((s.clamp(-1.0, 1.0) * 0.5 + 0.5) * u16::MAX as f32) as u16;
+                    for frame in data.chunks_exact_mut(out_channels) {
+                        let (l, r) = next_frame();
+                        if out_channels == 1 {
+                            frame[0] = to_u16((l + r) * 0.5);
+                        } else {
+                            frame[0] = to_u16(l);
+                            frame[1] = to_u16(r);
+                            for ch in 2..out_channels {
+                                frame[ch] = to_u16(0.0);
+                            }
+                        }
                     }
                 },
                 err_fn,
@@ -455,6 +485,13 @@ fn open_pulse_virtual_sink() -> Option<PaSimple> {
         channels: TARGET_CHANNELS as u8,
         rate: TARGET_SAMPLE_RATE,
     };
+    let attr = libpulse_binding::def::BufferAttr {
+        maxlength: u32::MAX,
+        tlength: (480 * 2 * 4 * 6) as u32,
+        prebuf: u32::MAX,
+        minreq: (480 * 2 * 4) as u32,
+        fragsize: u32::MAX,
+    };
     PaSimple::new(
         None,
         "RustSoundpad",
@@ -463,7 +500,7 @@ fn open_pulse_virtual_sink() -> Option<PaSimple> {
         "Soundboard",
         &spec,
         None,
-        None,
+        Some(&attr),
     )
     .ok()
 }
@@ -480,10 +517,10 @@ fn mixer_loop(
     let mut mic_buf = vec![0.0f32; chunk_samples];
 
     let tick_dur = Duration::from_millis(10);
+    let mut next_tick = std::time::Instant::now() + tick_dur;
+    let mut was_playing = false;
 
     while !shutdown.load(Ordering::Relaxed) {
-        let start = std::time::Instant::now();
-
         spk_buf.fill(0.0);
         mic_buf.fill(0.0);
 
@@ -584,9 +621,14 @@ fn mixer_loop(
         // Push speaker buffer to cpal ring buffer
         if has_audio {
             if let Ok(mut prod) = speaker_rb_prod.lock() {
+                if !was_playing && prod.occupied_len() < 2880 {
+                    let prebuf = [0.0f32; 2880];
+                    let _ = prod.push_slice(&prebuf);
+                }
                 let _ = prod.push_slice(&spk_buf);
             }
         }
+        was_playing = has_audio;
 
         // Push mic buffer to Pulse/PipeWire virtual sink (only when mic active & playing,
         // or push silence sparingly if already open to avoid underrun glitches)
@@ -611,9 +653,12 @@ fn mixer_loop(
             }
         }
 
-        let elapsed = start.elapsed();
-        if elapsed < tick_dur {
-            thread::sleep(tick_dur - elapsed);
+        let now = std::time::Instant::now();
+        if next_tick > now {
+            thread::sleep(next_tick - now);
+            next_tick += tick_dur;
+        } else {
+            next_tick = now + tick_dur;
         }
     }
 }
