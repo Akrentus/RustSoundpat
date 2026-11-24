@@ -1,0 +1,21 @@
+[package]
+name = "rust-soundpad"
+version = "0.1.0"
+edition = "2024"
+description = "Native Linux Soundpad analog for PipeWire and KDE Plasma 6 Wayland"
+
+[dependencies]
+eframe = "0.31"
+egui = "0.31"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+quick-xml = "0.37"
+rfd = "0.15"
+symphonia = { version = "0.5", features = ["mp3", "wav", "ogg", "flac", "pcm", "vorbis", "isomp4", "aac", "mkv"] }
+cpal = "0.15"
+evdev = "0.13"
+ctrlc = "3.4"
+dirs = "6.0"
+libpulse-binding = "2.28"
+libpulse-simple-binding = "2.28"
+ringbuf = "0.4"
