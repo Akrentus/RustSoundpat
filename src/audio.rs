@@ -120,18 +120,18 @@ impl AudioEngine {
                             path,
                             allow_overlap,
                         } => {
-                            let cached = {
-                                cache
-                                    .lock()
-                                    .ok()
-                                    .and_then(|c| c.get(&path).cloned())
-                            };
+                            let cached = cache.lock().ok().and_then(|mut c| {
+                                if !allow_overlap {
+                                    c.retain(|k, _| k == &path);
+                                }
+                                c.get(&path).cloned()
+                            });
                             let decoded = match cached {
                                 Some(a) => Ok(a),
                                 None => decode_audio_file(&path).map(|a| {
                                     let arc = Arc::new(a);
                                     if let Ok(mut c) = cache.lock() {
-                                        if c.len() > 64 {
+                                        if !allow_overlap || c.len() >= 4 {
                                             c.clear();
                                         }
                                         c.insert(path.clone(), Arc::clone(&arc));
@@ -392,6 +392,9 @@ impl AudioEngine {
             g.voices.clear();
             g.is_paused = false;
             g.mic_peak = 0.0;
+        }
+        if let Ok(mut c) = self.cache.lock() {
+            c.clear();
         }
     }
 
