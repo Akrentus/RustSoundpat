@@ -64,10 +64,22 @@ Because Wayland restricts global keyboard listening for regular GUI windows, Sou
 
 ## Build & Installation
 
+### Option 1: Install via Cargo
+
+Install the binary directly from GitHub using `cargo install`:
+
+```bash
+cargo install --git [https://github.com/Akrentus/RustSoundpat.git](https://github.com/Akrentus/RustSoundpat.git)
+```
+
+> **Note:** Cargo installs the executable as `rust-soundpad` in `~/.cargo/bin` (make sure `~/.cargo/bin` is in your `$PATH`).
+
+### Option 2: Build from Source (with Desktop Entry & Icon)
+
 Clone the repository and build the release binary (`rust-soundpad` in `Cargo.toml`):
 
 ```bash
-git clone https://github.com/Akrentus/RustSoundpat.git
+git clone [https://github.com/Akrentus/RustSoundpat.git](https://github.com/Akrentus/RustSoundpat.git)
 cd RustSoundpat
 cargo build --release
 ```
@@ -98,7 +110,7 @@ Make sure `~/.local/bin` is in your `$PATH`.
 
 ## Quick Start
 
-1. Launch **SoundPat** from your application menu or run `soundpat` in a terminal.
+1. Launch **SoundPat** from your application menu or run `soundpat` (or `rust-soundpad` if installed via Cargo) in a terminal.
 2. Open **Edit → Preferences → Devices** and select your **Physical Microphone** and **Output Device (Headphones)** (or leave them on `System Default`).
 3. Open **Discord**, **Steam**, **OBS**, or any game and set your **Input Device** to **`Rust Soundpad Virtual Mic`**.
 4. Drag and drop audio or video files into a category, assign global hotkeys via right-click → **Set Hotkey**, or hit the **Record** button on the toolbar to capture clips on the fly.
