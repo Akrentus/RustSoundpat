@@ -1,4 +1,6 @@
+use crate::audio::soft_limit;
 use crate::model::RecordingSource;
+use crate::pipewire::PipewireVirtualMic;
 use libpulse_binding::def::BufferAttr;
 use libpulse_binding::sample::{Format as PaFormat, Spec as PaSpec};
 use libpulse_binding::stream::Direction as PaDirection;
@@ -15,9 +17,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub const RECORD_SAMPLE_RATE: u32 = 48_000;
 pub const RECORD_CHANNELS: u16 = 2;
 pub const RECORD_BITS_PER_SAMPLE: u16 = 16;
-const CHUNK_FRAMES: usize = 480; // 10 ms at 48 kHz
+const CHUNK_FRAMES: usize = 1024; // Aligned with PipeWire 1024-frame quantum
 const CHUNK_SAMPLES: usize = CHUNK_FRAMES * RECORD_CHANNELS as usize;
-const CHUNK_BYTES: usize = CHUNK_SAMPLES * 2; // S16LE
+const CHUNK_F32_BYTES: usize = CHUNK_SAMPLES * std::mem::size_of::<f32>();
+const DUAL_SYNC_TIMEOUT: Duration = Duration::from_millis(25);
 
 struct ActiveRecording {
     stop_flag: Arc<AtomicBool>,
@@ -61,13 +64,19 @@ impl AudioRecorder {
         let mic_source = selected_mic
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
-            .unwrap_or("@DEFAULT_SOURCE@")
-            .to_string();
+            .map(|s| s.to_string())
+            .or_else(PipewireVirtualMic::detect_default_physical_mic);
 
         let (primary_src, secondary_src) = match source {
-            RecordingSource::Microphone => (mic_source, None),
+            RecordingSource::Microphone => (
+                mic_source.ok_or_else(|| "No physical microphone source found".to_string())?,
+                None,
+            ),
             RecordingSource::SystemAudio => (default_sink_monitor()?, None),
-            RecordingSource::Both => (mic_source, Some(default_sink_monitor()?)),
+            RecordingSource::Both => (
+                mic_source.ok_or_else(|| "No physical microphone source found".to_string())?,
+                Some(default_sink_monitor()?),
+            ),
         };
 
         let out_path = unique_recording_path(output_dir);
@@ -169,7 +178,7 @@ fn default_sink_monitor() -> Result<String, String> {
 
 fn open_record_stream(source: &str, stream_name: &str) -> Result<PaSimple, String> {
     let spec = PaSpec {
-        format: PaFormat::S16le,
+        format: PaFormat::FLOAT32NE,
         channels: RECORD_CHANNELS as u8,
         rate: RECORD_SAMPLE_RATE,
     };
@@ -178,7 +187,7 @@ fn open_record_stream(source: &str, stream_name: &str) -> Result<PaSimple, Strin
         tlength: u32::MAX,
         prebuf: u32::MAX,
         minreq: u32::MAX,
-        fragsize: CHUNK_BYTES as u32,
+        fragsize: CHUNK_F32_BYTES as u32,
     };
     PaSimple::new(
         None,
@@ -191,6 +200,24 @@ fn open_record_stream(source: &str, stream_name: &str) -> Result<PaSimple, Strin
         Some(&attr),
     )
     .map_err(|e| format!("Failed to open PulseAudio record stream '{source}': {e:?}"))
+}
+
+fn bytes_ne_to_f32(raw: &[u8], out: &mut Vec<f32>) {
+    out.clear();
+    out.reserve(raw.len() / 4);
+    for chunk in raw.chunks_exact(4) {
+        out.push(f32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+}
+
+#[inline]
+fn f32_to_s16(sample: f32) -> i16 {
+    let limited = if sample.is_finite() {
+        soft_limit(sample)
+    } else {
+        0.0
+    };
+    (limited.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16
 }
 
 fn record_single_loop(
@@ -217,20 +244,24 @@ fn record_single_loop(
 
     let _ = ready_tx.send(Ok(()));
 
-    let mut buf = [0u8; CHUNK_BYTES];
+    let mut raw_buf = [0u8; CHUNK_F32_BYTES];
+    let mut f32_buf = Vec::with_capacity(CHUNK_SAMPLES);
+    let mut wav_bytes = Vec::with_capacity(CHUNK_SAMPLES * 2);
     let mut data_bytes: u64 = 0;
     let mut stream_err: Option<String> = None;
 
     while !stop_flag.load(Ordering::Relaxed) {
-        if let Err(e) = stream.read(&mut buf) {
+        if let Err(e) = stream.read(&mut raw_buf) {
             stream_err = Some(format!("Audio capture error: {e:?}"));
             break;
         }
-        if let Err(e) = writer.write_all(&buf) {
+        bytes_ne_to_f32(&raw_buf, &mut f32_buf);
+        mix_f32_to_s16_bytes(&f32_buf, &[], &mut wav_bytes);
+        if let Err(e) = writer.write_all(&wav_bytes) {
             stream_err = Some(format!("Failed to write audio data: {e}"));
             break;
         }
-        data_bytes = data_bytes.saturating_add(buf.len() as u64);
+        data_bytes = data_bytes.saturating_add(wav_bytes.len() as u64);
     }
 
     let mut file = writer
@@ -244,16 +275,16 @@ fn record_single_loop(
     Ok(out_path)
 }
 
-fn spawn_pcm_reader(
+fn spawn_f32_reader(
     source: String,
     stream_name: &'static str,
     stop_flag: Arc<AtomicBool>,
 ) -> (
-    mpsc::Receiver<Vec<i16>>,
+    mpsc::Receiver<Vec<f32>>,
     mpsc::Receiver<Result<(), String>>,
     JoinHandle<()>,
 ) {
-    let (pcm_tx, pcm_rx) = mpsc::sync_channel::<Vec<i16>>(64);
+    let (pcm_tx, pcm_rx) = mpsc::sync_channel::<Vec<f32>>(64);
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), String>>(1);
 
     let handle = thread::spawn(move || {
@@ -266,15 +297,13 @@ fn spawn_pcm_reader(
         };
         let _ = ready_tx.send(Ok(()));
 
-        let mut raw = [0u8; CHUNK_BYTES];
+        let mut raw = [0u8; CHUNK_F32_BYTES];
         while !stop_flag.load(Ordering::Relaxed) {
             if stream.read(&mut raw).is_err() {
                 break;
             }
             let mut samples = Vec::with_capacity(CHUNK_SAMPLES);
-            for pair in raw.chunks_exact(2) {
-                samples.push(i16::from_le_bytes([pair[0], pair[1]]));
-            }
+            bytes_ne_to_f32(&raw, &mut samples);
             if pcm_tx.send(samples).is_err() {
                 break;
             }
@@ -293,9 +322,9 @@ fn record_dual_loop(
     ready_tx: mpsc::SyncSender<Result<(), String>>,
 ) -> Result<PathBuf, String> {
     let (mic_rx, mic_ready, mic_handle) =
-        spawn_pcm_reader(mic_source, "SoundPat Record Mic", Arc::clone(&stop_flag));
+        spawn_f32_reader(mic_source, "SoundPat Record Mic", Arc::clone(&stop_flag));
     let (sys_rx, sys_ready, sys_handle) =
-        spawn_pcm_reader(sys_source, "SoundPat Record System", Arc::clone(&stop_flag));
+        spawn_f32_reader(sys_source, "SoundPat Record System", Arc::clone(&stop_flag));
 
     let mic_init = mic_ready
         .recv()
@@ -328,18 +357,22 @@ fn record_dual_loop(
 
     let _ = ready_tx.send(Ok(()));
 
-    let mut mixed_bytes = Vec::with_capacity(CHUNK_BYTES);
+    let mut mixed_bytes = Vec::with_capacity(CHUNK_SAMPLES * 2);
     let mut data_bytes: u64 = 0;
     let mut write_err: Option<String> = None;
     let mut mic_open = true;
     let mut sys_open = true;
 
     while !stop_flag.load(Ordering::Relaxed) && (mic_open || sys_open) {
+        let mut mic_timed_out = false;
         let mic_chunk = if mic_open {
-            match mic_rx.try_recv() {
+            match mic_rx.recv_timeout(DUAL_SYNC_TIMEOUT) {
                 Ok(c) => Some(c),
-                Err(mpsc::TryRecvError::Empty) => None,
-                Err(mpsc::TryRecvError::Disconnected) => {
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    mic_timed_out = true;
+                    None
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
                     mic_open = false;
                     None
                 }
@@ -349,12 +382,23 @@ fn record_dual_loop(
         };
 
         let sys_chunk = if sys_open {
-            match sys_rx.try_recv() {
-                Ok(c) => Some(c),
-                Err(mpsc::TryRecvError::Empty) => None,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    sys_open = false;
-                    None
+            if mic_timed_out {
+                match sys_rx.try_recv() {
+                    Ok(c) => Some(c),
+                    Err(mpsc::TryRecvError::Empty) => None,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        sys_open = false;
+                        None
+                    }
+                }
+            } else {
+                match sys_rx.recv_timeout(DUAL_SYNC_TIMEOUT) {
+                    Ok(c) => Some(c),
+                    Err(mpsc::RecvTimeoutError::Timeout) => None,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        sys_open = false;
+                        None
+                    }
                 }
             }
         } else {
@@ -362,13 +406,10 @@ fn record_dual_loop(
         };
 
         match (mic_chunk, sys_chunk) {
-            (Some(a), Some(b)) => mix_s16_samples(&a, &b, &mut mixed_bytes),
-            (Some(a), None) => mix_s16_samples(&a, &[], &mut mixed_bytes),
-            (None, Some(b)) => mix_s16_samples(&[], &b, &mut mixed_bytes),
-            (None, None) => {
-                thread::sleep(Duration::from_millis(10));
-                continue;
-            }
+            (Some(a), Some(b)) => mix_f32_to_s16_bytes(&a, &b, &mut mixed_bytes),
+            (Some(a), None) => mix_f32_to_s16_bytes(&a, &[], &mut mixed_bytes),
+            (None, Some(b)) => mix_f32_to_s16_bytes(&[], &b, &mut mixed_bytes),
+            (None, None) => continue,
         }
 
         if let Err(e) = writer.write_all(&mixed_bytes) {
@@ -395,14 +436,14 @@ fn record_dual_loop(
     Ok(out_path)
 }
 
-pub fn mix_s16_samples(a: &[i16], b: &[i16], out: &mut Vec<u8>) {
+pub fn mix_f32_to_s16_bytes(a: &[f32], b: &[f32], out: &mut Vec<u8>) {
     out.clear();
     let len = a.len().max(b.len());
     out.reserve(len * 2);
     for i in 0..len {
-        let sa = *a.get(i).unwrap_or(&0) as i32;
-        let sb = *b.get(i).unwrap_or(&0) as i32;
-        let mixed = (sa + sb).clamp(-32768, 32767) as i16;
+        let sa = a.get(i).copied().unwrap_or(0.0);
+        let sb = b.get(i).copied().unwrap_or(0.0);
+        let mixed = f32_to_s16(sa + sb);
         out.extend_from_slice(&mixed.to_le_bytes());
     }
 }
@@ -539,14 +580,24 @@ mod tests {
     }
 
     #[test]
-    fn mix_s16_clamps_overflow_and_underflow() {
-        let a = [30_000i16, -30_000i16, 1234i16];
-        let b = [10_000i16, -10_000i16, -234i16];
+    fn mix_f32_applies_soft_limit_and_converts_to_s16() {
+        let a = [0.5f32, -0.5, 1.5, -1.5, 0.25];
+        let b = [0.25f32, -0.25, 1.0, -1.0];
         let mut out = Vec::new();
-        mix_s16_samples(&a, &b, &mut out);
-        assert_eq!(out.len(), 6);
-        assert_eq!(i16::from_le_bytes([out[0], out[1]]), 32_767);
-        assert_eq!(i16::from_le_bytes([out[2], out[3]]), -32_768);
-        assert_eq!(i16::from_le_bytes([out[4], out[5]]), 1_000);
+        mix_f32_to_s16_bytes(&a, &b, &mut out);
+        assert_eq!(out.len(), 10);
+
+        let s0 = i16::from_le_bytes([out[0], out[1]]);
+        let s1 = i16::from_le_bytes([out[2], out[3]]);
+        let s2 = i16::from_le_bytes([out[4], out[5]]);
+        let s3 = i16::from_le_bytes([out[6], out[7]]);
+        let s4 = i16::from_le_bytes([out[8], out[9]]);
+
+        assert!((s0 - (0.75 * i16::MAX as f32) as i16).abs() <= 1);
+        assert!((s1 - (-0.75 * i16::MAX as f32) as i16).abs() <= 1);
+        // 2.5 passed through tanh() is ~0.9866 -> below full clip, smooth limiting
+        assert!(s2 > 31_500 && s2 < i16::MAX);
+        assert!(s3 < -31_500 && s3 > -i16::MAX);
+        assert!((s4 - (0.25 * i16::MAX as f32) as i16).abs() <= 1);
     }
 }

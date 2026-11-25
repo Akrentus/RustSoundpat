@@ -667,7 +667,7 @@ fn mixer_loop(
 }
 
 #[inline]
-fn soft_limit(x: f32) -> f32 {
+pub fn soft_limit(x: f32) -> f32 {
     if x.abs() <= 0.95 {
         x
     } else {

@@ -1,5 +1,6 @@
 use crate::audio::{probe_audio_duration, AudioEngine, PlaybackStatus};
 use crate::config::{export_spl, import_spl, save_config};
+use crate::editor::{EditorAction, SoundEditor};
 use crate::hotkeys::{egui_key_to_name, HotkeyAction, HotkeyManager};
 use crate::icons;
 use crate::model::{AppConfig, Category, CategoryIcon, Hotkey, RecordingSource, SoundEntry};
@@ -135,6 +136,7 @@ pub struct SoundpadApp {
     last_selected_sound_id: Option<u64>,
     search_query: String,
     modal: ModalState,
+    editor: Option<SoundEditor>,
     show_mic_vol_popup: bool,
     dismiss_perm_banner: bool,
     status_toast: Option<String>,
@@ -210,6 +212,7 @@ impl SoundpadApp {
             last_selected_sound_id: None,
             search_query: String::new(),
             modal: ModalState::None,
+            editor: None,
             show_mic_vol_popup: false,
             dismiss_perm_banner: false,
             status_toast: None,
@@ -259,6 +262,15 @@ impl SoundpadApp {
         self.hotkey_bindings_dirty = true;
     }
 
+    fn find_sound(&self, sound_id: u64) -> Option<&SoundEntry> {
+        for cat in &self.config.categories {
+            if let Some(s) = cat.sounds.iter().find(|s| s.id == sound_id) {
+                return Some(s);
+            }
+        }
+        None
+    }
+
     fn find_sound_mut(&mut self, sound_id: u64) -> Option<&mut SoundEntry> {
         for cat in &mut self.config.categories {
             if let Some(s) = cat.sounds.iter_mut().find(|s| s.id == sound_id) {
@@ -266,6 +278,29 @@ impl SoundpadApp {
             }
         }
         None
+    }
+
+    fn open_sound_editor(&mut self, sound_id: u64) {
+        let Some((tag, path)) = self
+            .find_sound(sound_id)
+            .map(|s| (s.tag.clone(), s.path.clone()))
+        else {
+            return;
+        };
+        match SoundEditor::open(
+            sound_id,
+            tag,
+            path,
+            self.config.selected_output_device.as_deref(),
+        ) {
+            Ok(ed) => {
+                self.editor = Some(ed);
+                self.status_toast = None;
+            }
+            Err(e) => {
+                self.status_toast = Some(format!("Failed to open Sound Editor: {e}"));
+            }
+        }
     }
 
     fn play_sound_by_id(&mut self, sound_id: u64) {
@@ -725,13 +760,17 @@ impl SoundpadApp {
             }
         }
 
-        // Global UI shortcuts when no modal is capturing text
-        if matches!(self.modal, ModalState::None) && !ctx.wants_keyboard_input() {
-            let (ctrl_o, ctrl_f, del_pressed, enter_pressed, up_pressed, down_pressed) =
+        // Global UI shortcuts when no modal or editor is capturing input
+        if matches!(self.modal, ModalState::None)
+            && self.editor.is_none()
+            && !ctx.wants_keyboard_input()
+        {
+            let (ctrl_o, ctrl_f, ctrl_e, del_pressed, enter_pressed, up_pressed, down_pressed) =
                 ctx.input_mut(|i| {
                     (
                         i.consume_key(egui::Modifiers::CTRL, Key::O),
                         i.consume_key(egui::Modifiers::CTRL, Key::F),
+                        i.consume_key(egui::Modifiers::CTRL, Key::E),
                         i.consume_key(egui::Modifiers::NONE, Key::Delete),
                         i.consume_key(egui::Modifiers::NONE, Key::Enter),
                         i.consume_key(egui::Modifiers::NONE, Key::ArrowUp),
@@ -744,6 +783,14 @@ impl SoundpadApp {
             if ctrl_f {
                 self.config.search_visible = !self.config.search_visible;
                 self.mark_dirty();
+            }
+            if ctrl_e {
+                if let Some(sid) = self
+                    .last_selected_sound_id
+                    .or_else(|| self.selected_sound_ids.iter().next().copied())
+                {
+                    self.open_sound_editor(sid);
+                }
             }
             if del_pressed {
                 self.remove_selected_sounds();
@@ -1003,6 +1050,7 @@ impl eframe::App for SoundpadApp {
         // Modals & popups
         self.render_modals(ctx, &palette);
         self.render_mic_volume_popup(ctx, &palette);
+        self.render_sound_editor(ctx);
 
         if self.dirty_config && !ctx.input(|i| i.pointer.any_down()) {
             if save_config(&self.config).is_ok() {
@@ -1698,6 +1746,8 @@ impl SoundpadApp {
             .unwrap_or_default();
 
         let mut play_id: Option<u64> = None;
+        let mut edit_id: Option<u64> = None;
+        let mut open_folder_id: Option<u64> = None;
         let mut set_hk: Option<(u64, String)> = None;
         let mut remove_hk_id: Option<u64> = None;
         let mut rename_sound: Option<(u64, String)> = None;
@@ -1867,6 +1917,14 @@ impl SoundpadApp {
                             play_id = Some(*sound_id);
                             ui.close_menu();
                         }
+                        if ui.button("Edit Sound...").clicked() {
+                            edit_id = Some(*sound_id);
+                            ui.close_menu();
+                        }
+                        if ui.button("Open in Folder").clicked() {
+                            open_folder_id = Some(*sound_id);
+                            ui.close_menu();
+                        }
                         ui.separator();
                         if ui.button("Set Hotkey...").clicked() {
                             set_hk = Some((*sound_id, tag.clone()));
@@ -1899,6 +1957,14 @@ impl SoundpadApp {
 
         if let Some(id) = play_id {
             self.play_sound_by_id(id);
+        }
+        if let Some(id) = edit_id {
+            self.open_sound_editor(id);
+        }
+        if let Some(id) = open_folder_id {
+            if let Some(path) = self.find_sound(id).map(|s| s.path.clone()) {
+                open_in_folder(&path);
+            }
         }
         if let Some((sound_id, sound_tag)) = set_hk {
             self.modal = ModalState::SetHotkey {
@@ -2502,6 +2568,88 @@ impl SoundpadApp {
         }
     }
 
+    fn render_sound_editor(&mut self, ctx: &Context) {
+        let Some(mut ed) = self.editor.take() else {
+            return;
+        };
+
+        match ed.ui(ctx, self.config.dark_mode) {
+            Some(EditorAction::Close) => {
+                // Editor closed without saving (or after finishing); drop it.
+            }
+            Some(EditorAction::Saved {
+                sound_id,
+                old_path,
+                new_path,
+                duration_secs,
+            }) => {
+                self.audio.clear_cache_for(&old_path);
+                if new_path != old_path {
+                    self.audio.clear_cache_for(&new_path);
+                }
+                if let Some(entry) = self.find_sound_mut(sound_id) {
+                    entry.path = new_path.clone();
+                    entry.duration_secs = Some(duration_secs);
+                    entry.norm_gain = None;
+                }
+                match save_config(&self.config) {
+                    Ok(()) => {
+                        self.dirty_config = false;
+                        let name = new_path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "sound".to_string());
+                        self.status_toast = Some(format!("Saved: {name}"));
+                    }
+                    Err(e) => self.status_toast = Some(e),
+                }
+                self.editor = Some(ed);
+            }
+            Some(EditorAction::SavedAs {
+                path,
+                duration_secs,
+            }) => {
+                let id = self.config.alloc_id();
+                let tag = path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "Sound".to_string());
+                let entry = SoundEntry {
+                    id,
+                    path: path.clone(),
+                    tag,
+                    duration_secs: Some(duration_secs),
+                    hotkey: None,
+                    play_count: 0,
+                    norm_gain: None,
+                };
+                if let Some(cat) = self.config.selected_category_mut() {
+                    cat.sounds.push(entry);
+                }
+                self.selected_sound_ids.clear();
+                self.selected_sound_ids.insert(id);
+                self.last_selected_sound_id = Some(id);
+                self.scroll_to_sound_id = Some(id);
+                self.hotkey_bindings_dirty = true;
+                match save_config(&self.config) {
+                    Ok(()) => {
+                        self.dirty_config = false;
+                        let name = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "sound.wav".to_string());
+                        self.status_toast = Some(format!("Added edited copy: {name}"));
+                    }
+                    Err(e) => self.status_toast = Some(e),
+                }
+                self.editor = Some(ed);
+            }
+            None => {
+                self.editor = Some(ed);
+            }
+        }
+    }
+
     fn render_preferences_audio_tab(&mut self, ui: &mut Ui, palette: &ThemePalette) {
         ui.heading("Volume Levels");
         ui.add_space(6.0);
@@ -3003,4 +3151,50 @@ fn collect_audio_files_recursive(dir: &Path, out: &mut Vec<PathBuf>) {
             out.push(path);
         }
     }
+}
+
+fn encode_file_uri(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    let mut uri = String::with_capacity(7 + raw.len() * 2);
+    uri.push_str("file://");
+    for &b in raw.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'/') {
+            uri.push(b as char);
+        } else {
+            uri.push('%');
+            uri.push(char::from_digit((b >> 4) as u32, 16).unwrap_or('0').to_ascii_uppercase());
+            uri.push(char::from_digit((b & 0x0f) as u32, 16).unwrap_or('0').to_ascii_uppercase());
+        }
+    }
+    uri
+}
+
+fn open_in_folder(path: &Path) {
+    let path = path.to_path_buf();
+    thread::spawn(move || {
+        let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        let uri_arg = format!("array:string:{}", encode_file_uri(&canonical));
+        let dbus_ok = std::process::Command::new("dbus-send")
+            .args([
+                "--session",
+                "--print-reply",
+                "--reply-timeout=1500",
+                "--dest=org.freedesktop.FileManager1",
+                "--type=method_call",
+                "/org/freedesktop/FileManager1",
+                "org.freedesktop.FileManager1.ShowItems",
+                &uri_arg,
+                "string:",
+            ])
+            .output()
+            .is_ok_and(|out| out.status.success());
+
+        if !dbus_ok {
+            let parent = canonical
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let _ = std::process::Command::new("xdg-open").arg(parent).spawn();
+        }
+    });
 }

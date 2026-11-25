@@ -171,7 +171,7 @@ impl PipewireVirtualMic {
             .collect()
     }
 
-    fn detect_default_physical_mic() -> Option<String> {
+    pub fn detect_default_physical_mic() -> Option<String> {
         if let Ok(out) = Command::new("pactl").args(["get-default-source"]).output() {
             if out.status.success() {
                 let def = String::from_utf8_lossy(&out.stdout).trim().to_string();

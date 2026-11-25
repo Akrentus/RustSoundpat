@@ -1,6 +1,7 @@
 mod app;
 mod audio;
 mod config;
+mod editor;
 mod hotkeys;
 mod icons;
 mod model;
