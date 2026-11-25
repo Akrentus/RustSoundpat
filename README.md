@@ -69,7 +69,7 @@ Because Wayland restricts global keyboard listening for regular GUI windows, Sou
 Install the binary directly from GitHub using `cargo install`:
 
 ```bash
-cargo install --git [https://github.com/Akrentus/RustSoundpat.git](https://github.com/Akrentus/RustSoundpat.git)
+cargo install --git https://github.com/Akrentus/RustSoundpat.git
 ```
 
 > **Note:** Cargo installs the executable as `rust-soundpad` in `~/.cargo/bin` (make sure `~/.cargo/bin` is in your `$PATH`).
@@ -79,7 +79,7 @@ cargo install --git [https://github.com/Akrentus/RustSoundpat.git](https://githu
 Clone the repository and build the release binary (`rust-soundpad` in `Cargo.toml`):
 
 ```bash
-git clone [https://github.com/Akrentus/RustSoundpat.git](https://github.com/Akrentus/RustSoundpat.git)
+git clone https://github.com/Akrentus/RustSoundpat.git
 cd RustSoundpat
 cargo build --release
 ```
