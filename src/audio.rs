@@ -73,6 +73,80 @@ enum DecodeCmd {
     },
 }
 
+#[derive(Clone)]
+pub struct AudioEngineHandle {
+    mixer: Arc<Mutex<MixerInner>>,
+    decode_tx: mpsc::Sender<DecodeCmd>,
+    cache: Arc<Mutex<HashMap<PathBuf, Arc<DecodedAudio>>>>,
+}
+
+impl AudioEngineHandle {
+    pub fn play(&self, sound_id: u64, path: PathBuf, allow_overlap: bool) {
+        let _ = self.decode_tx.send(DecodeCmd::Play {
+            sound_id,
+            path,
+            allow_overlap,
+        });
+    }
+
+    pub fn toggle_pause(&self) {
+        if let Ok(mut g) = self.mixer.lock() {
+            if !g.voices.is_empty() {
+                g.is_paused = !g.is_paused;
+            }
+        }
+    }
+
+    pub fn set_paused(&self, paused: bool) {
+        if let Ok(mut g) = self.mixer.lock() {
+            if !g.voices.is_empty() {
+                g.is_paused = paused;
+            }
+        }
+    }
+
+    pub fn stop_all(&self) {
+        if let Ok(mut g) = self.mixer.lock() {
+            g.voices.clear();
+            g.is_paused = false;
+            g.mic_peak = 0.0;
+        }
+        if let Ok(mut c) = self.cache.lock() {
+            c.clear();
+        }
+    }
+
+    pub fn status(&self) -> PlaybackStatus {
+        let Ok(g) = self.mixer.lock() else {
+            return PlaybackStatus::default();
+        };
+        let primary = g
+            .voices
+            .iter()
+            .rev()
+            .find(|v| v.is_primary)
+            .or_else(|| g.voices.last());
+
+        if let Some(v) = primary {
+            PlaybackStatus {
+                current_sound_id: Some(v.sound_id),
+                position_secs: v.frame_pos as f32 / TARGET_SAMPLE_RATE as f32,
+                duration_secs: v.audio.duration_secs,
+                is_playing: !g.is_paused,
+                is_paused: g.is_paused,
+                mic_peak: g.mic_peak,
+                last_error: g.last_error.clone(),
+            }
+        } else {
+            PlaybackStatus {
+                mic_peak: g.mic_peak,
+                last_error: g.last_error.clone(),
+                ..Default::default()
+            }
+        }
+    }
+}
+
 pub struct AudioEngine {
     mixer: Arc<Mutex<MixerInner>>,
     decode_tx: mpsc::Sender<DecodeCmd>,
@@ -361,6 +435,14 @@ impl AudioEngine {
             return Vec::new();
         };
         devices.filter_map(|d| d.name().ok()).collect()
+    }
+
+    pub fn clone_handle(&self) -> AudioEngineHandle {
+        AudioEngineHandle {
+            mixer: Arc::clone(&self.mixer),
+            decode_tx: self.decode_tx.clone(),
+            cache: Arc::clone(&self.cache),
+        }
     }
 
     pub fn play(&self, sound_id: u64, path: PathBuf, allow_overlap: bool) {

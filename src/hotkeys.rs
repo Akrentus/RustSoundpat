@@ -42,7 +42,7 @@ pub struct HotkeyManager {
 }
 
 impl HotkeyManager {
-    pub fn start(repaint_ctx: Option<egui::Context>) -> Self {
+    pub fn start(repaint_ctx: Option<egui::Context>, on_action: Option<Arc<dyn Fn(&HotkeyAction) -> bool + Send + Sync>>) -> Self {
         let bindings = Arc::new(Mutex::new(HotkeyBindings {
             enabled: true,
             stop_hotkey: None,
@@ -60,7 +60,7 @@ impl HotkeyManager {
         let shutdown_bg = Arc::clone(&shutdown);
 
         thread::spawn(move || {
-            run_evdev_loop(bindings_bg, status_bg, shutdown_bg, tx, repaint_ctx);
+            run_evdev_loop(bindings_bg, status_bg, shutdown_bg, tx, repaint_ctx, on_action);
         });
 
         Self {
@@ -155,6 +155,7 @@ fn run_evdev_loop(
     shutdown: Arc<AtomicBool>,
     tx: mpsc::Sender<HotkeyAction>,
     repaint_ctx: Option<egui::Context>,
+    on_action: Option<Arc<dyn Fn(&HotkeyAction) -> bool + Send + Sync>>,
 ) {
     let (mut devices, mut perm_denied) = open_keyboard_devices();
     update_status(&status, &devices, perm_denied);
@@ -187,6 +188,7 @@ fn run_evdev_loop(
                                     &bindings,
                                     &tx,
                                     repaint_ctx.as_ref(),
+                                    on_action.as_deref(),
                                 );
                             } else if value == 0 {
                                 held_keys.remove(&code);
@@ -259,7 +261,17 @@ fn handle_key_press(
     bindings: &Arc<Mutex<HotkeyBindings>>,
     tx: &mpsc::Sender<HotkeyAction>,
     repaint_ctx: Option<&egui::Context>,
+    on_action: Option<&(dyn Fn(&HotkeyAction) -> bool + Send + Sync)>,
 ) {
+    let dispatch = |act: HotkeyAction| {
+        let handled = on_action.map(|cb| cb(&act)).unwrap_or(false);
+        if !handled {
+            let _ = tx.send(act);
+        }
+        if let Some(ctx) = repaint_ctx {
+            ctx.request_repaint();
+        }
+    };
     if is_modifier(code) {
         return;
     }
@@ -273,12 +285,9 @@ fn handle_key_press(
     };
 
     if g.capture_mode {
-        let _ = tx.send(HotkeyAction::Captured(Hotkey::new(
+        dispatch(HotkeyAction::Captured(Hotkey::new(
             ctrl, alt, shift, super_key, key_name,
         )));
-        if let Some(ctx) = repaint_ctx {
-            ctx.request_repaint();
-        }
         return;
     }
 
@@ -288,40 +297,28 @@ fn handle_key_press(
 
     if let Some(ref stop_hk) = g.stop_hotkey {
         if stop_hk.matches(ctrl, alt, shift, super_key, &key_name) {
-            let _ = tx.send(HotkeyAction::StopAll);
-            if let Some(ctx) = repaint_ctx {
-                ctx.request_repaint();
-            }
+            dispatch(HotkeyAction::StopAll);
             return;
         }
     }
 
     if let Some(ref pause_hk) = g.pause_hotkey {
         if pause_hk.matches(ctrl, alt, shift, super_key, &key_name) {
-            let _ = tx.send(HotkeyAction::TogglePause);
-            if let Some(ctx) = repaint_ctx {
-                ctx.request_repaint();
-            }
+            dispatch(HotkeyAction::TogglePause);
             return;
         }
     }
 
     if let Some(ref rec_hk) = g.record_hotkey {
         if rec_hk.matches(ctrl, alt, shift, super_key, &key_name) {
-            let _ = tx.send(HotkeyAction::ToggleRecord);
-            if let Some(ctx) = repaint_ctx {
-                ctx.request_repaint();
-            }
+            dispatch(HotkeyAction::ToggleRecord);
             return;
         }
     }
 
     for (sound_id, hk) in &g.sounds {
         if hk.matches(ctrl, alt, shift, super_key, &key_name) {
-            let _ = tx.send(HotkeyAction::PlaySound(*sound_id));
-            if let Some(ctx) = repaint_ctx {
-                ctx.request_repaint();
-            }
+            dispatch(HotkeyAction::PlaySound(*sound_id));
             break;
         }
     }

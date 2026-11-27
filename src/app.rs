@@ -12,7 +12,7 @@ use egui::{
 };
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
 #[derive(Debug, Clone)]
@@ -126,6 +126,14 @@ enum ModalState {
     About,
 }
 
+#[derive(Default)]
+struct BgHotkeyState {
+    selected_or_first_sound: Option<(u64, PathBuf)>,
+    all_sounds: Vec<(u64, PathBuf)>,
+    allow_overlap: bool,
+    played_counts: Vec<u64>,
+}
+
 pub struct SoundpadApp {
     pub config: AppConfig,
     pub audio: AudioEngine,
@@ -148,6 +156,7 @@ pub struct SoundpadApp {
     dirty_config: bool,
     last_always_on_top: bool,
     hotkey_bindings_dirty: bool,
+    bg_hotkey_state: Arc<Mutex<BgHotkeyState>>,
 }
 
 impl SoundpadApp {
@@ -173,7 +182,64 @@ impl SoundpadApp {
             pipewire.status_message = format!("PipeWire setup error: {e}");
         }
 
-        let hotkeys = HotkeyManager::start(Some(cc.egui_ctx.clone()));
+        let bg_hotkey_state = Arc::new(Mutex::new(BgHotkeyState::default()));
+        let bg_state_cb = Arc::clone(&bg_hotkey_state);
+        let audio_handle = audio.clone_handle();
+        let hotkeys = HotkeyManager::start(
+            Some(cc.egui_ctx.clone()),
+            Some(Arc::new(move |act: &HotkeyAction| -> bool {
+                match act {
+                    HotkeyAction::StopAll => {
+                        audio_handle.stop_all();
+                        true
+                    }
+                    HotkeyAction::PlaySound(id) => {
+                        if let Ok(mut st) = bg_state_cb.lock() {
+                            if let Some((_, path)) = st.all_sounds.iter().find(|(sid, _)| sid == id).cloned() {
+                                audio_handle.play(*id, path, st.allow_overlap);
+                                st.played_counts.push(*id);
+                                return true;
+                            }
+                        }
+                        false
+                    }
+                    HotkeyAction::TogglePause => {
+                        let status = audio_handle.status();
+                        let target = bg_state_cb.lock().ok().and_then(|st| {
+                            st.selected_or_first_sound.clone().map(|(id, p)| (id, p, st.allow_overlap))
+                        });
+                        if let Some((sel_id, sel_path, allow_overlap)) = target {
+                            if status.current_sound_id == Some(sel_id) {
+                                if status.is_playing {
+                                    audio_handle.set_paused(true);
+                                } else if status.is_paused {
+                                    audio_handle.set_paused(false);
+                                } else {
+                                    audio_handle.play(sel_id, sel_path, allow_overlap);
+                                    if let Ok(mut st) = bg_state_cb.lock() {
+                                        st.played_counts.push(sel_id);
+                                    }
+                                }
+                            } else if status.is_playing || status.is_paused {
+                                audio_handle.toggle_pause();
+                            } else {
+                                audio_handle.play(sel_id, sel_path, allow_overlap);
+                                if let Ok(mut st) = bg_state_cb.lock() {
+                                    st.played_counts.push(sel_id);
+                                }
+                            }
+                            true
+                        } else if status.is_playing || status.is_paused {
+                            audio_handle.toggle_pause();
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    _ => false,
+                }
+            })),
+        );
 
         let (req_tx, req_rx) = mpsc::channel::<(u64, PathBuf)>();
         let (res_tx, res_rx) = mpsc::channel::<(u64, f32)>();
@@ -224,9 +290,30 @@ impl SoundpadApp {
             dirty_config: false,
             last_always_on_top: always_on_top,
             hotkey_bindings_dirty: true,
+            bg_hotkey_state,
         };
         app.sync_hotkey_bindings();
         app
+    }
+
+    fn sync_bg_hotkey_state(&self) {
+        if let Ok(mut st) = self.bg_hotkey_state.lock() {
+            st.allow_overlap = self.config.allow_overlap;
+            st.all_sounds.clear();
+            for cat in &self.config.categories {
+                for s in &cat.sounds {
+                    st.all_sounds.push((s.id, s.path.clone()));
+                }
+            }
+            let target_id = self.last_selected_sound_id.or_else(|| {
+                self.config
+                    .selected_category()
+                    .and_then(|c| c.sounds.first())
+                    .map(|s| s.id)
+            });
+            st.selected_or_first_sound = target_id
+                .and_then(|id| self.find_sound(id).map(|s| (s.id, s.path.clone())));
+        }
     }
 
     fn sync_hotkey_bindings(&mut self) {
@@ -713,12 +800,28 @@ impl SoundpadApp {
             }
         }
 
+        // Sync play counts triggered from background evdev thread while hidden
+        let bg_played: Vec<u64> = self
+            .bg_hotkey_state
+            .lock()
+            .map(|mut st| st.played_counts.drain(..).collect())
+            .unwrap_or_default();
+        for pid in bg_played {
+            if let Some(s) = self.find_sound_mut(pid) {
+                s.play_count = s.play_count.saturating_add(1);
+            }
+            self.selected_sound_ids.clear();
+            self.selected_sound_ids.insert(pid);
+            self.last_selected_sound_id = Some(pid);
+            self.dirty_config = true;
+        }
+
         // Hotkey actions from evdev thread
         for act in self.hotkeys.poll_actions() {
             match act {
                 HotkeyAction::PlaySound(id) => self.play_sound_by_id(id),
                 HotkeyAction::StopAll => self.audio.stop_all(),
-                HotkeyAction::TogglePause => self.audio.toggle_pause(),
+                HotkeyAction::TogglePause => self.toggle_play_selected_or_first(),
                 HotkeyAction::ToggleRecord => self.toggle_recording(),
                 HotkeyAction::Captured(hk) => self.apply_captured_hotkey(hk),
             }
@@ -875,6 +978,7 @@ impl eframe::App for SoundpadApp {
         if self.hotkey_bindings_dirty {
             self.sync_hotkey_bindings();
         }
+        self.sync_bg_hotkey_state();
 
         if self.last_always_on_top != self.config.always_on_top {
             self.last_always_on_top = self.config.always_on_top;
