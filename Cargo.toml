@@ -1,6 +1,6 @@
 [package]
 name = "rust-soundpad"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Native Linux Soundpad analog for PipeWire and KDE Plasma 6 Wayland"
 
