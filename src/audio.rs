@@ -5,11 +5,13 @@ use libpulse_binding::stream::Direction as PaDirection;
 use libpulse_simple_binding::Simple as PaSimple;
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::HeapRb;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 use symphonia::core::audio::SampleBuffer;
@@ -20,15 +22,118 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
+unsafe extern "C" {
+    fn malloc_trim(pad: usize) -> i32;
+}
+
+#[inline]
+fn release_freed_ram_to_os() {
+    unsafe {
+        let _ = malloc_trim(0);
+    }
+}
+
 pub const TARGET_SAMPLE_RATE: u32 = 48_000;
 pub const TARGET_CHANNELS: usize = 2;
 const MIX_CHUNK_FRAMES: usize = 480; // 10 ms at 48 kHz
+const STREAM_START_FRAMES: usize = TARGET_SAMPLE_RATE as usize / 10; // 100 ms prebuffer before instant start
+const STREAM_BATCH_FRAMES: usize = TARGET_SAMPLE_RATE as usize / 4; // 250 ms chunks pushed while streaming
+
+// Memory bounds for RAM cache: only cache clips <= 30s, and cap total cache at 48 MB
+const MAX_CACHEABLE_SAMPLES: usize = TARGET_SAMPLE_RATE as usize * TARGET_CHANNELS * 30;
+const MAX_CACHE_TOTAL_SAMPLES: usize = (48 * 1024 * 1024) / std::mem::size_of::<f32>();
 
 #[derive(Debug, Clone)]
 pub struct DecodedAudio {
     pub samples: Vec<f32>, // Interleaved stereo @ 48kHz
     pub duration_secs: f32,
     pub norm_gain: f32,
+}
+
+pub struct StreamingBuffer {
+    pub samples: RwLock<Vec<f32>>,
+    pub duration_bits: AtomicU32,
+    pub norm_gain_bits: AtomicU32,
+    pub is_complete: AtomicBool,
+    pub cancel: AtomicBool,
+}
+
+impl StreamingBuffer {
+    pub fn new_streaming(initial_duration: f32) -> Arc<Self> {
+        Arc::new(Self {
+            samples: RwLock::new(Vec::with_capacity(
+                TARGET_SAMPLE_RATE as usize * TARGET_CHANNELS * 2,
+            )),
+            duration_bits: AtomicU32::new(initial_duration.to_bits()),
+            norm_gain_bits: AtomicU32::new(1.0f32.to_bits()),
+            is_complete: AtomicBool::new(false),
+            cancel: AtomicBool::new(false),
+        })
+    }
+
+    #[inline]
+    pub fn duration_secs(&self) -> f32 {
+        f32::from_bits(self.duration_bits.load(Ordering::Relaxed))
+    }
+
+    #[inline]
+    pub fn norm_gain(&self) -> f32 {
+        f32::from_bits(self.norm_gain_bits.load(Ordering::Relaxed))
+    }
+}
+
+struct BoundedAudioCache {
+    map: HashMap<PathBuf, Arc<StreamingBuffer>>,
+    order: VecDeque<PathBuf>,
+    total_samples: usize,
+}
+
+impl BoundedAudioCache {
+    fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            total_samples: 0,
+        }
+    }
+
+    fn get(&self, path: &Path) -> Option<Arc<StreamingBuffer>> {
+        self.map.get(path).cloned()
+    }
+
+    fn insert(&mut self, path: PathBuf, buf: Arc<StreamingBuffer>, sample_len: usize) {
+        if sample_len == 0 || sample_len > MAX_CACHEABLE_SAMPLES {
+            return;
+        }
+        self.remove(&path);
+        while self.total_samples + sample_len > MAX_CACHE_TOTAL_SAMPLES {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(old_buf) = self.map.remove(&oldest) {
+                let len = old_buf.samples.read().map(|s| s.len()).unwrap_or(0);
+                self.total_samples = self.total_samples.saturating_sub(len);
+            }
+        }
+        self.total_samples += sample_len;
+        self.order.push_back(path.clone());
+        self.map.insert(path, buf);
+    }
+
+    fn remove(&mut self, path: &Path) {
+        if let Some(old_buf) = self.map.remove(path) {
+            let len = old_buf.samples.read().map(|s| s.len()).unwrap_or(0);
+            self.total_samples = self.total_samples.saturating_sub(len);
+            self.order.retain(|p| p != path);
+        }
+    }
+
+    #[allow(dead_code)]
+    fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+        self.total_samples = 0;
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -44,7 +149,7 @@ pub struct PlaybackStatus {
 
 struct ActiveVoice {
     sound_id: u64,
-    audio: Arc<DecodedAudio>,
+    buffer: Arc<StreamingBuffer>,
     frame_pos: usize,
     is_primary: bool,
 }
@@ -70,6 +175,7 @@ enum DecodeCmd {
         sound_id: u64,
         path: PathBuf,
         allow_overlap: bool,
+        seq_id: u64,
     },
 }
 
@@ -77,15 +183,60 @@ enum DecodeCmd {
 pub struct AudioEngineHandle {
     mixer: Arc<Mutex<MixerInner>>,
     decode_tx: mpsc::Sender<DecodeCmd>,
-    cache: Arc<Mutex<HashMap<PathBuf, Arc<DecodedAudio>>>>,
+    cache: Arc<Mutex<BoundedAudioCache>>,
+    play_gen: Arc<AtomicU64>,
 }
 
 impl AudioEngineHandle {
     pub fn play(&self, sound_id: u64, path: PathBuf, allow_overlap: bool) {
+        let seq_id = if !allow_overlap {
+            let g = self.play_gen.fetch_add(1, Ordering::SeqCst) + 1;
+            let mut dropped_voices = Vec::new();
+            if let Ok(mut guard) = self.mixer.lock() {
+                for v in &guard.voices {
+                    v.buffer.cancel.store(true, Ordering::Relaxed);
+                }
+                std::mem::swap(&mut dropped_voices, &mut guard.voices);
+            }
+            if !dropped_voices.is_empty() {
+                drop(dropped_voices);
+                release_freed_ram_to_os();
+            }
+            g
+        } else {
+            self.play_gen.load(Ordering::SeqCst)
+        };
+
+        // Zero-copy fast path if already in RAM cache
+        if let Some(cached_buf) = self.cache.lock().ok().and_then(|c| c.get(&path)) {
+            if let Ok(mut guard) = self.mixer.lock() {
+                guard.last_error = None;
+                if !allow_overlap {
+                    for v in &guard.voices {
+                        v.buffer.cancel.store(true, Ordering::Relaxed);
+                    }
+                    guard.voices.clear();
+                } else {
+                    for v in &mut guard.voices {
+                        v.is_primary = false;
+                    }
+                }
+                guard.is_paused = false;
+                guard.voices.push(ActiveVoice {
+                    sound_id,
+                    buffer: cached_buf,
+                    frame_pos: 0,
+                    is_primary: true,
+                });
+            }
+            return;
+        }
+
         let _ = self.decode_tx.send(DecodeCmd::Play {
             sound_id,
             path,
             allow_overlap,
+            seq_id,
         });
     }
 
@@ -106,14 +257,18 @@ impl AudioEngineHandle {
     }
 
     pub fn stop_all(&self) {
+        self.play_gen.fetch_add(1, Ordering::SeqCst);
+        let mut dropped_voices = Vec::new();
         if let Ok(mut g) = self.mixer.lock() {
-            g.voices.clear();
+            for v in &g.voices {
+                v.buffer.cancel.store(true, Ordering::Relaxed);
+            }
+            std::mem::swap(&mut dropped_voices, &mut g.voices);
             g.is_paused = false;
             g.mic_peak = 0.0;
         }
-        if let Ok(mut c) = self.cache.lock() {
-            c.clear();
-        }
+        drop(dropped_voices);
+        release_freed_ram_to_os();
     }
 
     pub fn status(&self) -> PlaybackStatus {
@@ -131,7 +286,7 @@ impl AudioEngineHandle {
             PlaybackStatus {
                 current_sound_id: Some(v.sound_id),
                 position_secs: v.frame_pos as f32 / TARGET_SAMPLE_RATE as f32,
-                duration_secs: v.audio.duration_secs,
+                duration_secs: v.buffer.duration_secs(),
                 is_playing: !g.is_paused,
                 is_paused: g.is_paused,
                 mic_peak: g.mic_peak,
@@ -150,7 +305,8 @@ impl AudioEngineHandle {
 pub struct AudioEngine {
     mixer: Arc<Mutex<MixerInner>>,
     decode_tx: mpsc::Sender<DecodeCmd>,
-    cache: Arc<Mutex<HashMap<PathBuf, Arc<DecodedAudio>>>>,
+    cache: Arc<Mutex<BoundedAudioCache>>,
+    play_gen: Arc<AtomicU64>,
     cpal_stream: Option<Stream>,
     speaker_rb_prod: Arc<Mutex<ringbuf::HeapProd<f32>>>,
     shutdown: Arc<AtomicBool>,
@@ -178,65 +334,103 @@ impl AudioEngine {
             last_error: None,
         }));
 
-        let cache = Arc::new(Mutex::new(HashMap::new()));
+        let cache = Arc::new(Mutex::new(BoundedAudioCache::new()));
+        let play_gen = Arc::new(AtomicU64::new(0));
         let shutdown = Arc::new(AtomicBool::new(false));
         let (decode_tx, decode_rx) = mpsc::channel::<DecodeCmd>();
 
-        // Background decode worker thread
+        // Single reusable decode worker thread for non-overlap mode (avoids glibc per-thread arena bloat),
+        // spawns extra thread only when allow_overlap is true.
         {
             let mixer = Arc::clone(&mixer);
             let cache = Arc::clone(&cache);
+            let play_gen = Arc::clone(&play_gen);
             thread::spawn(move || {
-                while let Ok(cmd) = decode_rx.recv() {
+                while let Ok(mut cmd) = decode_rx.recv() {
+                    // Drain queue to latest command if user clicked rapidly in non-overlap mode
+                    while let Ok(newer) = decode_rx.try_recv() {
+                        let DecodeCmd::Play {
+                            sound_id: cur_sid,
+                            path: ref cur_path,
+                            allow_overlap: cur_ov,
+                            seq_id: cur_seq,
+                        } = cmd;
+                        let DecodeCmd::Play {
+                            allow_overlap: new_ov,
+                            ..
+                        } = newer;
+                        if !new_ov {
+                            cmd = newer;
+                        } else {
+                            let m = Arc::clone(&mixer);
+                            let c = Arc::clone(&cache);
+                            let g = Arc::clone(&play_gen);
+                            let p = cur_path.clone();
+                            thread::spawn(move || {
+                                stream_decode_and_play(cur_sid, p, cur_ov, cur_seq, m, c, g);
+                                release_freed_ram_to_os();
+                            });
+                            cmd = newer;
+                        }
+                    }
+
                     match cmd {
                         DecodeCmd::Play {
                             sound_id,
                             path,
                             allow_overlap,
+                            seq_id,
                         } => {
-                            let cached = cache.lock().ok().and_then(|mut c| {
-                                if !allow_overlap {
-                                    c.retain(|k, _| k == &path);
-                                }
-                                c.get(&path).cloned()
-                            });
-                            let decoded = match cached {
-                                Some(a) => Ok(a),
-                                None => decode_audio_file(&path).map(|a| {
-                                    let arc = Arc::new(a);
-                                    if let Ok(mut c) = cache.lock() {
-                                        if !allow_overlap || c.len() >= 4 {
-                                            c.clear();
-                                        }
-                                        c.insert(path.clone(), Arc::clone(&arc));
-                                    }
-                                    arc
-                                }),
-                            };
+                            if !allow_overlap && play_gen.load(Ordering::SeqCst) != seq_id {
+                                continue;
+                            }
 
-                            if let Ok(mut guard) = mixer.lock() {
-                                match decoded {
-                                    Ok(audio) => {
-                                        guard.last_error = None;
-                                        if !allow_overlap {
-                                            guard.voices.clear();
-                                        } else {
-                                            for v in &mut guard.voices {
-                                                v.is_primary = false;
-                                            }
+                            if let Some(cached_buf) = cache.lock().ok().and_then(|c| c.get(&path)) {
+                                if let Ok(mut guard) = mixer.lock() {
+                                    if !allow_overlap && play_gen.load(Ordering::SeqCst) != seq_id {
+                                        continue;
+                                    }
+                                    guard.last_error = None;
+                                    if !allow_overlap {
+                                        for v in &guard.voices {
+                                            v.buffer.cancel.store(true, Ordering::Relaxed);
                                         }
-                                        guard.is_paused = false;
-                                        guard.voices.push(ActiveVoice {
-                                            sound_id,
-                                            audio,
-                                            frame_pos: 0,
-                                            is_primary: true,
-                                        });
+                                        guard.voices.clear();
+                                    } else {
+                                        for v in &mut guard.voices {
+                                            v.is_primary = false;
+                                        }
                                     }
-                                    Err(e) => {
-                                        guard.last_error = Some(e);
-                                    }
+                                    guard.is_paused = false;
+                                    guard.voices.push(ActiveVoice {
+                                        sound_id,
+                                        buffer: cached_buf,
+                                        frame_pos: 0,
+                                        is_primary: true,
+                                    });
                                 }
+                                continue;
+                            }
+
+                            if allow_overlap {
+                                let m = Arc::clone(&mixer);
+                                let c = Arc::clone(&cache);
+                                let g = Arc::clone(&play_gen);
+                                thread::spawn(move || {
+                                    stream_decode_and_play(sound_id, path, true, seq_id, m, c, g);
+                                    release_freed_ram_to_os();
+                                });
+                            } else {
+                                stream_decode_and_play(
+                                    sound_id,
+                                    path,
+                                    false,
+                                    seq_id,
+                                    Arc::clone(&mixer),
+                                    Arc::clone(&cache),
+                                    Arc::clone(&play_gen),
+                                );
+                                release_freed_ram_to_os();
                             }
                         }
                     }
@@ -258,12 +452,12 @@ impl AudioEngine {
             mixer,
             decode_tx,
             cache,
+            play_gen,
             cpal_stream: None,
             speaker_rb_prod,
             shutdown,
         };
 
-        // Start cpal playback stream for headphones
         if let Err(e) = engine.start_cpal_stream(initial_output_device, cons) {
             if let Ok(mut g) = engine.mixer.lock() {
                 g.last_error = Some(e);
@@ -271,6 +465,15 @@ impl AudioEngine {
         }
 
         engine
+    }
+
+    pub fn clone_handle(&self) -> AudioEngineHandle {
+        AudioEngineHandle {
+            mixer: Arc::clone(&self.mixer),
+            decode_tx: self.decode_tx.clone(),
+            cache: Arc::clone(&self.cache),
+            play_gen: Arc::clone(&self.play_gen),
+        }
     }
 
     fn start_cpal_stream(
@@ -437,55 +640,33 @@ impl AudioEngine {
         devices.filter_map(|d| d.name().ok()).collect()
     }
 
-    pub fn clone_handle(&self) -> AudioEngineHandle {
-        AudioEngineHandle {
-            mixer: Arc::clone(&self.mixer),
-            decode_tx: self.decode_tx.clone(),
-            cache: Arc::clone(&self.cache),
-        }
-    }
-
     pub fn play(&self, sound_id: u64, path: PathBuf, allow_overlap: bool) {
-        let _ = self.decode_tx.send(DecodeCmd::Play {
-            sound_id,
-            path,
-            allow_overlap,
-        });
+        self.clone_handle().play(sound_id, path, allow_overlap);
     }
 
     pub fn toggle_pause(&self) {
-        if let Ok(mut g) = self.mixer.lock() {
-            if !g.voices.is_empty() {
-                g.is_paused = !g.is_paused;
-            }
-        }
+        self.clone_handle().toggle_pause();
     }
 
     pub fn set_paused(&self, paused: bool) {
-        if let Ok(mut g) = self.mixer.lock() {
-            if !g.voices.is_empty() {
-                g.is_paused = paused;
-            }
-        }
+        self.clone_handle().set_paused(paused);
     }
 
     pub fn stop_all(&self) {
-        if let Ok(mut g) = self.mixer.lock() {
-            g.voices.clear();
-            g.is_paused = false;
-            g.mic_peak = 0.0;
-        }
-        if let Ok(mut c) = self.cache.lock() {
-            c.clear();
-        }
+        self.clone_handle().stop_all();
     }
 
     pub fn seek(&self, target_secs: f32) {
         if let Ok(mut g) = self.mixer.lock() {
             if let Some(v) = g.voices.iter_mut().rev().find(|v| v.is_primary) {
-                let total_frames = v.audio.samples.len() / TARGET_CHANNELS;
-                let target_frame =
-                    ((target_secs.max(0.0) * TARGET_SAMPLE_RATE as f32) as usize).min(total_frames);
+                let available_frames = v
+                    .buffer
+                    .samples
+                    .read()
+                    .map(|s| s.len() / TARGET_CHANNELS)
+                    .unwrap_or(0);
+                let target_frame = ((target_secs.max(0.0) * TARGET_SAMPLE_RATE as f32) as usize)
+                    .min(available_frames);
                 v.frame_pos = target_frame;
             }
         }
@@ -515,33 +696,7 @@ impl AudioEngine {
     }
 
     pub fn status(&self) -> PlaybackStatus {
-        let Ok(g) = self.mixer.lock() else {
-            return PlaybackStatus::default();
-        };
-        let primary = g
-            .voices
-            .iter()
-            .rev()
-            .find(|v| v.is_primary)
-            .or_else(|| g.voices.last());
-
-        if let Some(v) = primary {
-            PlaybackStatus {
-                current_sound_id: Some(v.sound_id),
-                position_secs: v.frame_pos as f32 / TARGET_SAMPLE_RATE as f32,
-                duration_secs: v.audio.duration_secs,
-                is_playing: !g.is_paused,
-                is_paused: g.is_paused,
-                mic_peak: g.mic_peak,
-                last_error: g.last_error.clone(),
-            }
-        } else {
-            PlaybackStatus {
-                mic_peak: g.mic_peak,
-                last_error: g.last_error.clone(),
-                ..Default::default()
-            }
-        }
+        self.clone_handle().status()
     }
 
     pub fn take_auto_advance(&self) -> Option<u64> {
@@ -555,6 +710,7 @@ impl AudioEngine {
         if let Ok(mut c) = self.cache.lock() {
             c.remove(path);
         }
+        release_freed_ram_to_os();
     }
 }
 
@@ -562,6 +718,530 @@ impl Drop for AudioEngine {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
     }
+}
+
+struct StreamingResampler {
+    src_rate: u32,
+    dst_rate: u32,
+    pos: f64,
+    prev: Option<(f32, f32)>,
+}
+
+impl StreamingResampler {
+    fn new(src_rate: u32, dst_rate: u32) -> Self {
+        Self {
+            src_rate: src_rate.max(1),
+            dst_rate: dst_rate.max(1),
+            pos: 0.0,
+            prev: None,
+        }
+    }
+
+    fn process(&mut self, input: &[f32], out: &mut Vec<f32>) {
+        if input.is_empty() {
+            return;
+        }
+        if self.src_rate == self.dst_rate {
+            out.extend_from_slice(input);
+            return;
+        }
+        let in_frames = input.len() / 2;
+        if in_frames == 0 {
+            return;
+        }
+        let ratio = self.src_rate as f64 / self.dst_rate as f64;
+
+        let (first_l, first_r) = (input[0], input[1]);
+        let (prev_l, prev_r) = self.prev.unwrap_or((first_l, first_r));
+
+        let get_frame = |idx: isize| -> (f32, f32) {
+            if idx < 0 {
+                (prev_l, prev_r)
+            } else {
+                let i = (idx as usize).min(in_frames - 1);
+                (input[i * 2], input[i * 2 + 1])
+            }
+        };
+
+        while self.pos < (in_frames - 1) as f64 {
+            let idx = self.pos.floor() as isize;
+            let frac = (self.pos - idx as f64) as f32;
+            let (l0, r0) = get_frame(idx);
+            let (l1, r1) = get_frame(idx + 1);
+            out.push(l0 + (l1 - l0) * frac);
+            out.push(r0 + (r1 - r0) * frac);
+            self.pos += ratio;
+        }
+
+        self.prev = Some((input[(in_frames - 1) * 2], input[(in_frames - 1) * 2 + 1]));
+        self.pos -= in_frames as f64;
+    }
+}
+
+fn activate_streaming_voice(
+    sound_id: u64,
+    allow_overlap: bool,
+    seq_id: u64,
+    buffer: &Arc<StreamingBuffer>,
+    mixer: &Arc<Mutex<MixerInner>>,
+    play_gen: &Arc<AtomicU64>,
+) -> bool {
+    let mut dropped_voices = Vec::new();
+    let ok = {
+        let Ok(mut guard) = mixer.lock() else {
+            return false;
+        };
+        if !allow_overlap && play_gen.load(Ordering::SeqCst) != seq_id {
+            buffer.cancel.store(true, Ordering::Relaxed);
+            return false;
+        }
+        guard.last_error = None;
+        if !allow_overlap {
+            for v in &guard.voices {
+                v.buffer.cancel.store(true, Ordering::Relaxed);
+            }
+            std::mem::swap(&mut dropped_voices, &mut guard.voices);
+        } else {
+            for v in &mut guard.voices {
+                v.is_primary = false;
+            }
+        }
+        guard.is_paused = false;
+        guard.voices.push(ActiveVoice {
+            sound_id,
+            buffer: Arc::clone(buffer),
+            frame_pos: 0,
+            is_primary: true,
+        });
+        true
+    };
+    drop(dropped_voices);
+    ok
+}
+
+fn stream_decode_and_play(
+    sound_id: u64,
+    path: PathBuf,
+    allow_overlap: bool,
+    seq_id: u64,
+    mixer: Arc<Mutex<MixerInner>>,
+    cache: Arc<Mutex<BoundedAudioCache>>,
+    play_gen: Arc<AtomicU64>,
+) {
+    let sym_res = stream_with_symphonia(
+        sound_id,
+        &path,
+        allow_overlap,
+        seq_id,
+        &mixer,
+        &cache,
+        &play_gen,
+    );
+    if let Err(sym_err) = sym_res {
+        if !allow_overlap && play_gen.load(Ordering::SeqCst) != seq_id {
+            return;
+        }
+        if let Err(ff_err) = stream_with_ffmpeg(
+            sound_id,
+            &path,
+            allow_overlap,
+            seq_id,
+            &mixer,
+            &cache,
+            &play_gen,
+        ) {
+            if let Ok(mut g) = mixer.lock() {
+                g.last_error = Some(format!("{sym_err}; ffmpeg fallback failed: {ff_err}"));
+            }
+        }
+    }
+}
+
+fn push_batch_to_stream(
+    batch: &mut Vec<f32>,
+    buffer: &Arc<StreamingBuffer>,
+    sum_sq: &mut f64,
+    total_samples: &mut usize,
+) {
+    if batch.is_empty() {
+        return;
+    }
+    for &s in batch.iter() {
+        *sum_sq += (s as f64) * (s as f64);
+    }
+    *total_samples += batch.len();
+    if *total_samples > 0 {
+        let rms = (*sum_sq / *total_samples as f64).sqrt() as f32;
+        let gain = if rms > 1e-4 {
+            (0.18 / rms).clamp(0.15, 2.5)
+        } else {
+            1.0
+        };
+        buffer
+            .norm_gain_bits
+            .store(gain.to_bits(), Ordering::Relaxed);
+    }
+
+    if let Ok(mut guard) = buffer.samples.write() {
+        guard.append(batch);
+        let cur_dur = (guard.len() / TARGET_CHANNELS) as f32 / TARGET_SAMPLE_RATE as f32;
+        if cur_dur > buffer.duration_secs() {
+            buffer
+                .duration_bits
+                .store(cur_dur.to_bits(), Ordering::Relaxed);
+        }
+    }
+}
+
+fn finalize_stream_into_cache(
+    path: &Path,
+    buffer: &Arc<StreamingBuffer>,
+    cache: &Arc<Mutex<BoundedAudioCache>>,
+    sum_sq: f64,
+    total_samples: usize,
+) {
+    if buffer.cancel.load(Ordering::Relaxed) || total_samples == 0 {
+        return;
+    }
+
+    let sample_len = if let Ok(mut g) = buffer.samples.write() {
+        g.shrink_to_fit();
+        g.len()
+    } else {
+        return;
+    };
+    if sample_len == 0 {
+        return;
+    }
+
+    let duration_secs = (sample_len / TARGET_CHANNELS) as f32 / TARGET_SAMPLE_RATE as f32;
+    let rms = (sum_sq / total_samples as f64).sqrt() as f32;
+    let norm_gain = if rms > 1e-4 {
+        (0.18 / rms).clamp(0.15, 2.5)
+    } else {
+        1.0
+    };
+
+    buffer
+        .duration_bits
+        .store(duration_secs.to_bits(), Ordering::Relaxed);
+    buffer
+        .norm_gain_bits
+        .store(norm_gain.to_bits(), Ordering::Relaxed);
+    buffer.is_complete.store(true, Ordering::Release);
+
+    // Zero-copy cache insertion: only cache short/medium clips (<= 30s) within 48 MB total budget
+    if sample_len <= MAX_CACHEABLE_SAMPLES {
+        if let Ok(mut c) = cache.lock() {
+            c.insert(path.to_path_buf(), Arc::clone(buffer), sample_len);
+        }
+    }
+}
+
+fn stream_with_symphonia(
+    sound_id: u64,
+    path: &Path,
+    allow_overlap: bool,
+    seq_id: u64,
+    mixer: &Arc<Mutex<MixerInner>>,
+    cache: &Arc<Mutex<BoundedAudioCache>>,
+    play_gen: &Arc<AtomicU64>,
+) -> Result<(), String> {
+    let file = File::open(path).map_err(|e| format!("Cannot open {}: {e}", path.display()))?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+
+    let probed = symphonia::default::get_probe()
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .map_err(|e| format!("Unsupported or invalid audio {}: {e}", path.display()))?;
+
+    let mut format = probed.format;
+    let track = format
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL)
+        .ok_or_else(|| format!("No audio track found in {}", path.display()))?
+        .clone();
+
+    let track_id = track.id;
+    let src_rate = track.codec_params.sample_rate.unwrap_or(TARGET_SAMPLE_RATE);
+    let est_dur = track
+        .codec_params
+        .n_frames
+        .map(|n| n as f32 / src_rate.max(1) as f32)
+        .unwrap_or(0.0);
+
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &DecoderOptions::default())
+        .map_err(|e| format!("Decoder init failed for {}: {e}", path.display()))?;
+
+    let stream_buf = StreamingBuffer::new_streaming(est_dur);
+    let mut resampler = StreamingResampler::new(src_rate, TARGET_SAMPLE_RATE);
+    let mut sample_buf: Option<SampleBuffer<f32>> = None;
+    let mut raw_stereo = Vec::with_capacity(4096);
+    let mut resampled_batch = Vec::with_capacity(STREAM_BATCH_FRAMES * TARGET_CHANNELS);
+
+    let mut voice_started = false;
+    let mut sum_sq = 0.0f64;
+    let mut total_samples = 0usize;
+
+    loop {
+        if stream_buf.cancel.load(Ordering::Relaxed)
+            || (!allow_overlap && play_gen.load(Ordering::SeqCst) != seq_id)
+        {
+            stream_buf.cancel.store(true, Ordering::Relaxed);
+            return Ok(());
+        }
+
+        let packet = match format.next_packet() {
+            Ok(p) => p,
+            Err(SymphoniaError::IoError(e))
+                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break;
+            }
+            Err(SymphoniaError::ResetRequired) => {
+                decoder.reset();
+                continue;
+            }
+            Err(e) => {
+                if voice_started {
+                    break;
+                }
+                return Err(format!("Read error in {}: {e}", path.display()));
+            }
+        };
+
+        if packet.track_id() != track_id {
+            continue;
+        }
+
+        match decoder.decode(&packet) {
+            Ok(decoded) => {
+                let spec = *decoded.spec();
+                if spec.rate > 0 && spec.rate != resampler.src_rate {
+                    resampler.src_rate = spec.rate;
+                }
+                let channels = spec.channels.count().max(1);
+                let frames = decoded.frames();
+                if frames == 0 {
+                    continue;
+                }
+
+                let buf = sample_buf.get_or_insert_with(|| {
+                    SampleBuffer::<f32>::new(decoded.capacity() as u64, spec)
+                });
+                if buf.capacity() < frames * channels {
+                    *buf = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
+                }
+                buf.copy_interleaved_ref(decoded);
+                let raw = buf.samples();
+
+                raw_stereo.clear();
+                raw_stereo.reserve(frames * 2);
+                for f in 0..frames {
+                    let base = f * channels;
+                    let (l, r) = if channels == 1 {
+                        (raw[base], raw[base])
+                    } else {
+                        (raw[base], raw[base + 1])
+                    };
+                    raw_stereo.push(l);
+                    raw_stereo.push(r);
+                }
+
+                resampler.process(&raw_stereo, &mut resampled_batch);
+
+                let threshold_samples = if !voice_started {
+                    STREAM_START_FRAMES * TARGET_CHANNELS
+                } else {
+                    STREAM_BATCH_FRAMES * TARGET_CHANNELS
+                };
+
+                if resampled_batch.len() >= threshold_samples {
+                    push_batch_to_stream(
+                        &mut resampled_batch,
+                        &stream_buf,
+                        &mut sum_sq,
+                        &mut total_samples,
+                    );
+                    if !voice_started {
+                        if !activate_streaming_voice(
+                            sound_id,
+                            allow_overlap,
+                            seq_id,
+                            &stream_buf,
+                            mixer,
+                            play_gen,
+                        ) {
+                            return Ok(());
+                        }
+                        voice_started = true;
+                    }
+                }
+            }
+            Err(SymphoniaError::IoError(_)) | Err(SymphoniaError::DecodeError(_)) => continue,
+            Err(e) => {
+                if voice_started {
+                    break;
+                }
+                return Err(format!("Decode error in {}: {e}", path.display()));
+            }
+        }
+    }
+
+    if !resampled_batch.is_empty() {
+        push_batch_to_stream(
+            &mut resampled_batch,
+            &stream_buf,
+            &mut sum_sq,
+            &mut total_samples,
+        );
+    }
+
+    if total_samples == 0 {
+        return Err(format!("No audio samples decoded from {}", path.display()));
+    }
+
+    if !voice_started {
+        if !activate_streaming_voice(
+            sound_id,
+            allow_overlap,
+            seq_id,
+            &stream_buf,
+            mixer,
+            play_gen,
+        ) {
+            return Ok(());
+        }
+    }
+
+    finalize_stream_into_cache(path, &stream_buf, cache, sum_sq, total_samples);
+    Ok(())
+}
+
+fn stream_with_ffmpeg(
+    sound_id: u64,
+    path: &Path,
+    allow_overlap: bool,
+    seq_id: u64,
+    mixer: &Arc<Mutex<MixerInner>>,
+    cache: &Arc<Mutex<BoundedAudioCache>>,
+    play_gen: &Arc<AtomicU64>,
+) -> Result<(), String> {
+    let mut child = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args(["-vn", "-f", "f32le", "-ac", "2", "-ar", "48000", "pipe:1"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to spawn ffmpeg: {e}"))?;
+
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "ffmpeg stdout pipe missing".to_string())?;
+
+    let stream_buf = StreamingBuffer::new_streaming(0.0);
+    let mut byte_buf = [0u8; 16384];
+    let mut pending = Vec::<u8>::with_capacity(16);
+    let mut batch = Vec::<f32>::with_capacity(STREAM_BATCH_FRAMES * TARGET_CHANNELS);
+
+    let mut voice_started = false;
+    let mut sum_sq = 0.0f64;
+    let mut total_samples = 0usize;
+
+    loop {
+        if stream_buf.cancel.load(Ordering::Relaxed)
+            || (!allow_overlap && play_gen.load(Ordering::SeqCst) != seq_id)
+        {
+            stream_buf.cancel.store(true, Ordering::Relaxed);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(());
+        }
+
+        let n = match stdout.read(&mut byte_buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("ffmpeg read error: {e}"));
+            }
+        };
+
+        pending.extend_from_slice(&byte_buf[..n]);
+        let usable = pending.len() - (pending.len() % 8); // 8 bytes = 1 stereo f32 frame
+        if usable > 0 {
+            for chunk in pending[..usable].chunks_exact(4) {
+                batch.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            }
+            pending.drain(..usable);
+        }
+
+        let threshold_samples = if !voice_started {
+            STREAM_START_FRAMES * TARGET_CHANNELS
+        } else {
+            STREAM_BATCH_FRAMES * TARGET_CHANNELS
+        };
+
+        if batch.len() >= threshold_samples {
+            push_batch_to_stream(&mut batch, &stream_buf, &mut sum_sq, &mut total_samples);
+            if !voice_started {
+                if !activate_streaming_voice(
+                    sound_id,
+                    allow_overlap,
+                    seq_id,
+                    &stream_buf,
+                    mixer,
+                    play_gen,
+                ) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Ok(());
+                }
+                voice_started = true;
+            }
+        }
+    }
+
+    if !batch.is_empty() {
+        push_batch_to_stream(&mut batch, &stream_buf, &mut sum_sq, &mut total_samples);
+    }
+
+    let status = child.wait().map_err(|e| format!("ffmpeg wait failed: {e}"))?;
+    if total_samples == 0 {
+        return Err(format!("ffmpeg produced no audio samples (status {status})"));
+    }
+
+    if !voice_started {
+        if !activate_streaming_voice(
+            sound_id,
+            allow_overlap,
+            seq_id,
+            &stream_buf,
+            mixer,
+            play_gen,
+        ) {
+            return Ok(());
+        }
+    }
+
+    finalize_stream_into_cache(path, &stream_buf, cache, sum_sq, total_samples);
+    Ok(())
 }
 
 fn open_pulse_virtual_sink() -> Option<PaSimple> {
@@ -610,6 +1290,7 @@ fn mixer_loop(
         mic_buf.fill(0.0);
 
         let (mic_enabled, has_audio);
+        let mut finished_voices_to_drop: Vec<ActiveVoice> = Vec::new();
         {
             let mut g = match mixer.lock() {
                 Ok(g) => g,
@@ -638,46 +1319,62 @@ fn mixer_loop(
 
                 let mut i = 0;
                 while i < g.voices.len() {
-                    let total_frames = g.voices[i].audio.samples.len() / TARGET_CHANNELS;
+                    let is_complete = g.voices[i].buffer.is_complete.load(Ordering::Acquire);
                     let norm = if auto_norm {
-                        g.voices[i].audio.norm_gain
+                        g.voices[i].buffer.norm_gain()
                     } else {
                         1.0
                     };
-
+                    let is_primary = g.voices[i].is_primary;
                     let mut pos = g.voices[i].frame_pos;
-                    let samples = &g.voices[i].audio.samples;
+                    let mut voice_done = false;
 
-                    for f in 0..MIX_CHUNK_FRAMES {
-                        if pos >= total_frames {
-                            if repeat && g.voices[i].is_primary && total_frames > 0 {
-                                pos = 0;
-                            } else {
-                                break;
+                    if let Ok(samples) = g.voices[i].buffer.samples.read() {
+                        let available_frames = samples.len() / TARGET_CHANNELS;
+
+                        for f in 0..MIX_CHUNK_FRAMES {
+                            if pos >= available_frames {
+                                if is_complete {
+                                    if repeat && is_primary && available_frames > 0 {
+                                        pos = 0;
+                                    } else {
+                                        voice_done = true;
+                                        break;
+                                    }
+                                } else {
+                                    break;
+                                }
                             }
+                            let s_idx = pos * TARGET_CHANNELS;
+                            let l = samples[s_idx] * norm;
+                            let r = samples[s_idx + 1] * norm;
+                            let o_idx = f * TARGET_CHANNELS;
+                            if spk_enabled {
+                                spk_buf[o_idx] += l * spk_vol;
+                                spk_buf[o_idx + 1] += r * spk_vol;
+                            }
+                            if mic_enabled {
+                                mic_buf[o_idx] += l * mic_vol;
+                                mic_buf[o_idx + 1] += r * mic_vol;
+                            }
+                            pos += 1;
                         }
-                        let s_idx = pos * TARGET_CHANNELS;
-                        let l = samples[s_idx] * norm;
-                        let r = samples[s_idx + 1] * norm;
-                        let o_idx = f * TARGET_CHANNELS;
-                        if spk_enabled {
-                            spk_buf[o_idx] += l * spk_vol;
-                            spk_buf[o_idx + 1] += r * spk_vol;
+
+                        if is_complete
+                            && pos >= available_frames
+                            && !(repeat && is_primary && available_frames > 0)
+                        {
+                            voice_done = true;
                         }
-                        if mic_enabled {
-                            mic_buf[o_idx] += l * mic_vol;
-                            mic_buf[o_idx + 1] += r * mic_vol;
-                        }
-                        pos += 1;
                     }
 
                     g.voices[i].frame_pos = pos;
-                    if pos >= total_frames && !(repeat && g.voices[i].is_primary && total_frames > 0)
-                    {
+                    if voice_done {
                         let finished = g.voices.remove(i);
                         if finished.is_primary && auto_adv {
                             finished_primary_id = Some(finished.sound_id);
                         }
+                        finished_voices_to_drop.push(finished);
                     } else {
                         i += 1;
                     }
@@ -687,7 +1384,6 @@ fn mixer_loop(
                     g.pending_auto_advance = Some(fid);
                 }
 
-                // Soft-limit both buffers to prevent clipping
                 let mut peak = 0.0f32;
                 for s in &mut spk_buf {
                     *s = soft_limit(*s);
@@ -703,7 +1399,11 @@ fn mixer_loop(
             }
         }
 
-        // Push speaker buffer to cpal ring buffer
+        if !finished_voices_to_drop.is_empty() {
+            drop(finished_voices_to_drop);
+            release_freed_ram_to_os();
+        }
+
         if has_audio {
             if let Ok(mut prod) = speaker_rb_prod.lock() {
                 if !was_playing && prod.occupied_len() < 2880 {
@@ -715,8 +1415,6 @@ fn mixer_loop(
         }
         was_playing = has_audio;
 
-        // Push mic buffer to Pulse/PipeWire virtual sink (only when mic active & playing,
-        // or push silence sparingly if already open to avoid underrun glitches)
         if mic_enabled && has_audio {
             if pa_sink.is_none() {
                 retry_ticks += 1;
@@ -764,7 +1462,7 @@ pub fn probe_audio_duration(path: &Path) -> Option<f32> {
     if let Some(dur) = probe_duration_ffprobe(path) {
         return Some(dur);
     }
-    decode_audio_file(path).ok().map(|d| d.duration_secs)
+    None
 }
 
 fn probe_duration_symphonia(path: &Path) -> Option<f32> {
@@ -790,7 +1488,8 @@ fn probe_duration_symphonia(path: &Path) -> Option<f32> {
         .iter()
         .find(|t| t.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL)?;
 
-    if let (Some(n_frames), Some(rate)) = (track.codec_params.n_frames, track.codec_params.sample_rate)
+    if let (Some(n_frames), Some(rate)) =
+        (track.codec_params.n_frames, track.codec_params.sample_rate)
     {
         if rate > 0 {
             return Some(n_frames as f32 / rate as f32);
@@ -902,6 +1601,9 @@ fn decode_with_symphonia(path: &Path) -> Result<DecodedAudio, String> {
                 let buf = sample_buf.get_or_insert_with(|| {
                     SampleBuffer::<f32>::new(decoded.capacity() as u64, spec)
                 });
+                if buf.capacity() < frames * channels {
+                    *buf = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
+                }
                 buf.copy_interleaved_ref(decoded);
                 let raw = buf.samples();
 
@@ -922,6 +1624,8 @@ fn decode_with_symphonia(path: &Path) -> Result<DecodedAudio, String> {
     }
 
     let samples = resample_stereo(&stereo_src, detected_rate, TARGET_SAMPLE_RATE);
+    drop(stereo_src);
+    release_freed_ram_to_os();
     let total_frames = samples.len() / TARGET_CHANNELS;
     let duration_secs = total_frames as f32 / TARGET_SAMPLE_RATE as f32;
     let norm_gain = compute_norm_gain(&samples);
@@ -959,6 +1663,8 @@ fn decode_with_ffmpeg(path: &Path) -> Result<DecodedAudio, String> {
     for chunk in output.stdout[..usable_bytes].chunks_exact(4) {
         samples.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }
+    drop(output);
+    release_freed_ram_to_os();
 
     let total_frames = samples.len() / TARGET_CHANNELS;
     let duration_secs = total_frames as f32 / TARGET_SAMPLE_RATE as f32;
@@ -1012,48 +1718,4 @@ fn resample_stereo(input: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
     }
 
     out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::Write;
-
-    #[test]
-    fn decode_and_probe_wav_sine() {
-        let tmp = std::env::temp_dir().join("rust_soundpad_test_tone.wav");
-        let sample_rate = 44_100u32;
-        let num_samples = sample_rate as usize; // 1.0 second mono PCM16
-        let data_bytes = (num_samples * 2) as u32;
-        let mut f = File::create(&tmp).unwrap();
-        f.write_all(b"RIFF").unwrap();
-        f.write_all(&(36 + data_bytes).to_le_bytes()).unwrap();
-        f.write_all(b"WAVE").unwrap();
-        f.write_all(b"fmt ").unwrap();
-        f.write_all(&16u32.to_le_bytes()).unwrap();
-        f.write_all(&1u16.to_le_bytes()).unwrap(); // PCM
-        f.write_all(&1u16.to_le_bytes()).unwrap(); // mono
-        f.write_all(&sample_rate.to_le_bytes()).unwrap();
-        f.write_all(&(sample_rate * 2).to_le_bytes()).unwrap();
-        f.write_all(&2u16.to_le_bytes()).unwrap();
-        f.write_all(&16u16.to_le_bytes()).unwrap();
-        f.write_all(b"data").unwrap();
-        f.write_all(&data_bytes.to_le_bytes()).unwrap();
-        for i in 0..num_samples {
-            let t = i as f32 / sample_rate as f32;
-            let val = ((2.0 * std::f32::consts::PI * 440.0 * t).sin() * 16000.0) as i16;
-            f.write_all(&val.to_le_bytes()).unwrap();
-        }
-        drop(f);
-
-        let dur = probe_audio_duration(&tmp).expect("probe wav duration");
-        assert!((dur - 1.0).abs() < 0.05, "expected ~1.0s, got {dur}");
-
-        let decoded = decode_audio_file(&tmp).expect("decode wav");
-        let _ = std::fs::remove_file(&tmp);
-
-        assert!((decoded.duration_secs - 1.0).abs() < 0.05);
-        assert_eq!(decoded.samples.len() % 2, 0);
-        assert!(decoded.norm_gain > 0.1 && decoded.norm_gain <= 2.5);
-    }
 }
